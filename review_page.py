@@ -38,22 +38,22 @@ GROUPS = data_module.GROUPS
 REVIEW = getattr(data_module, "REVIEW", {})
 
 OUT = args.output
-PROMPT = args.prompt.read_text()
+PROMPT = args.prompt.read_text(encoding="utf-8")
 assert PROMPT.strip(), "the English review prompt must not be empty"
 WS = args.workspace
 ASSETS = args.assets
-CSS = (ASSETS / "theme.css").read_text()
-JS = (ASSETS / "app.js").read_text()
-THEME_INIT = (ASSETS / "theme-init.js").read_text()
+CSS = (ASSETS / "theme.css").read_text(encoding="utf-8")
+JS = (ASSETS / "app.js").read_text(encoding="utf-8")
+THEME_INIT = (ASSETS / "theme-init.js").read_text(encoding="utf-8")
 try:
     HEAD = subprocess.check_output(["git", "-C", str(WS), "rev-parse", "--short", "HEAD"], text=True).strip()
 except subprocess.CalledProcessError:
     HEAD = "unknown"
 
-DIFF = args.diff.read_text()
-META = {x["path"]: x for x in json.loads(args.files_json.read_text())}
-RUST_METRICS = json.loads(args.metrics.read_text())
-TS_METRICS = json.loads(args.ts_metrics.read_text())
+DIFF = args.diff.read_text(encoding="utf-8", errors="replace")
+META = {x["path"]: x for x in json.loads(args.files_json.read_text(encoding="utf-8"))}
+RUST_METRICS = json.loads(args.metrics.read_text(encoding="utf-8"))
+TS_METRICS = json.loads(args.ts_metrics.read_text(encoding="utf-8"))
 
 
 TITLE = REVIEW.get("title", "Code review")
@@ -116,7 +116,9 @@ def parse_diff(text):
     files = {}
     cur = None
     hunk = None
-    for line in text.splitlines():
+    for line in text.split("\n"):
+        if line == "":
+            continue
         if line.startswith("diff --git "):
             cur = {"items": [], "hunk_count": 0}
             files[_diff_dst_path(line)] = cur
@@ -178,27 +180,6 @@ def start_re(path):
     return None
 
 
-TEST_LINE = {}
-
-
-def rust_test_line(path):
-    if path in TEST_LINE:
-        return TEST_LINE[path]
-    line = None
-    try:
-        source = (WS / path).read_text().splitlines()
-    except OSError:
-        source = []
-    for i, text in enumerate(source):
-        if text.strip() == "#[cfg(test)]":
-            nxt = [x.strip() for x in source[i + 1:i + 4] if x.strip()]
-            if nxt and nxt[0].startswith("mod tests"):
-                line = i + 1
-                break
-    TEST_LINE[path] = line
-    return line
-
-
 def test_item_ranges(path, items):
     """Return item-index ranges that are Rust `#[cfg(test)] mod tests` code.
 
@@ -209,7 +190,7 @@ def test_item_ranges(path, items):
     if not path.endswith(".rs"):
         return []
     src = WS / path
-    source = src.read_text(errors="replace").splitlines() if src.exists() else []
+    source = src.read_text(encoding="utf-8", errors="replace").split("\n") if src.exists() else []
     line_ranges = []
     i = 0
     while i < len(source):
@@ -325,12 +306,10 @@ def resolve_notes(path):
                 found = i
                 break
         if found is None:
-            print(f"UNRESOLVED {path}: {anchor!r}")
-            continue
+            raise SystemExit(f"UNRESOLVED {path}: {anchor!r}")
         block = next((b for b in blocks if b[0] <= found <= b[1]), None)
         if block is None:
-            print(f"NOBLOCK {path}: {anchor!r}")
-            continue
+            raise SystemExit(f"NOBLOCK {path}: {anchor!r}")
         if note.get("span"):
             start = found
             end = min(block[1], found + note["span"] - 1)
@@ -750,8 +729,8 @@ for gid, title, desc in GROUPS:
   {''.join(cards)}
 </article>""")
 
-notes_total = sum(len(d["notes"]) for d in FILES.values())
-folded_total = sum(1 for d in FILES.values() if d["fold"])
+notes_total = sum(len(RESOLVED[p][0]) for p in FILES)
+folded_total = sum(1 for p, d in FILES.items() if d["fold"] and not RESOLVED[p][0])
 total_add = sum(m["add"] for m in META.values())
 total_del = sum(m["del"] for m in META.values())
 new_files = sum(1 for m in META.values() if m["status"] == "A")
@@ -876,5 +855,5 @@ page = f"""<!doctype html>
 </body>
 </html>"""
 
-OUT.write_text(page)
+OUT.write_text(page, encoding="utf-8")
 print(f"wrote {OUT} ({OUT.stat().st_size/1024/1024:.1f} MiB)")
