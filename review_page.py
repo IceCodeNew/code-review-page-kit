@@ -13,7 +13,6 @@ import html
 import importlib.util
 import json
 import re
-import shlex
 import subprocess
 from pathlib import Path
 
@@ -87,6 +86,41 @@ def _unquote_git_path(token):
     return token
 
 
+def _git_header_tokens(rest):
+    """Split a `diff --git` path header, honoring Git's C-quoted filenames."""
+    tokens = []
+    i = 0
+    while i < len(rest):
+        if rest[i] == " ":
+            i += 1
+            continue
+        if rest[i] == '"':
+            i += 1
+            buf = []
+            while i < len(rest):
+                ch = rest[i]
+                if ch == "\\":
+                    buf.append(ch)
+                    i += 1
+                    if i < len(rest):
+                        buf.append(rest[i])
+                        i += 1
+                elif ch == '"':
+                    i += 1
+                    break
+                else:
+                    buf.append(ch)
+                    i += 1
+            tokens.append('"' + "".join(buf) + '"')
+        else:
+            j = rest.find(" ", i)
+            if j == -1:
+                j = len(rest)
+            tokens.append(rest[i:j])
+            i = j
+    return tokens
+
+
 def _diff_dst_path(line):
     """Return the destination path of a `diff --git` header, without the b/ prefix."""
     rest = line[len("diff --git "):]
@@ -100,10 +134,7 @@ def _diff_dst_path(line):
         path = rest.rsplit(" b/", 1)[-1]
         if path != rest:
             return path
-    try:
-        parts = shlex.split(rest, posix=False)
-    except ValueError as exc:
-        raise ValueError(f"cannot parse diff header: {line!r}") from exc
+    parts = _git_header_tokens(rest)
     if len(parts) != 2:
         raise ValueError(f"cannot parse diff header: {line!r}")
     dst = _unquote_git_path(parts[1])
@@ -180,41 +211,127 @@ def start_re(path):
     return None
 
 
+def _line_number(text, index):
+    return text.count("\n", 0, index) + 1
+
+
+def _skip_string(text, i):
+    """Return the index after a normal Rust string starting at `i`."""
+    i += 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+        elif ch == '"':
+            return i + 1
+        else:
+            i += 1
+    return len(text)
+
+
+def _raw_string_start(text, i):
+    """Return (content_start, hash_count) for r/br raw strings, else None."""
+    p = i
+    if text.startswith("br", p):
+        p += 2
+    elif p < len(text) and text[p] == "r":
+        p += 1
+    else:
+        return None
+    hashes = 0
+    while p < len(text) and text[p] == "#":
+        hashes += 1
+        p += 1
+    if p < len(text) and text[p] == '"':
+        return p + 1, hashes
+    return None
+
+
+def _skip_raw_string(text, start, hashes):
+    needle = '"' + "#" * hashes
+    end = text.find(needle, start)
+    return len(text) if end == -1 else end + len(needle)
+
+
+def _rust_matching_brace(text, open_index):
+    """Find the matching brace, ignoring strings, chars and comments."""
+    depth = 0
+    i = open_index
+    while i < len(text):
+        ch = text[i]
+        if ch == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            end = text.find("\n", i)
+            i = len(text) if end == -1 else end
+        elif ch == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            level = 1
+            i += 2
+            while i < len(text) and level:
+                if text.startswith("/*", i):
+                    level += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    level -= 1
+                    i += 2
+                else:
+                    i += 1
+        elif ch == '"':
+            i = _skip_string(text, i)
+        elif ch == "r" or (ch == "b" and i + 1 < len(text) and text[i + 1] == "r"):
+            raw = _raw_string_start(text, i)
+            if raw:
+                i = _skip_raw_string(text, raw[0], raw[1])
+            else:
+                i += 1
+        elif ch == "'":
+            # Char literal only if a closing quote follows soon; otherwise a
+            # lifetime such as 'a.
+            j = i + 1
+            if j < len(text) and text[j] == "\\":
+                j += 2
+            else:
+                j += 1
+            if j < len(text) and text[j] == "'":
+                i = j + 1
+            else:
+                i += 1
+        elif ch == "{":
+            depth += 1
+            i += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+        else:
+            i += 1
+    return None
+
+
 def test_item_ranges(path, items):
     """Return item-index ranges that are Rust `#[cfg(test)] mod tests` code.
 
     Test modules are located in the *new* source, then mapped to the diff item
-    sequence. Deleted lines before the module must not be mistaken for test
-    code, and production code after a test module is not folded.
+    sequence. The brace matcher ignores braces in strings, chars, raw strings
+    and comments, so production code after a test module is not folded.
     """
     if not path.endswith(".rs"):
         return []
     src = WS / path
-    source = src.read_text(encoding="utf-8", errors="replace").split("\n") if src.exists() else []
+    text = src.read_text(encoding="utf-8", errors="replace") if src.exists() else ""
     line_ranges = []
-    i = 0
-    while i < len(source):
-        if source[i].strip() != "#[cfg(test)]":
-            i += 1
+    for match in re.finditer(r"(?m)^\s*#\[cfg\(test\)\]\s*$", text):
+        tail = text[match.end(): match.end() + 500]
+        mod = re.search(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+tests\b", tail)
+        if not mod:
             continue
-        j = i + 1
-        while j < len(source) and not source[j].strip():
-            j += 1
-        if j >= len(source) or not source[j].strip().startswith("mod tests"):
-            i += 1
+        mod_pos = match.end() + mod.start()
+        open_pos = text.find("{", mod_pos)
+        if open_pos == -1:
             continue
-        depth = 0
-        started = False
-        end = j
-        for k in range(j, len(source)):
-            depth += source[k].count("{") - source[k].count("}")
-            if "{" in source[k]:
-                started = True
-            if started and depth <= 0:
-                end = k
-                break
-        line_ranges.append((i + 1, end + 1))
-        i = end + 1
+        close_pos = _rust_matching_brace(text, open_pos)
+        if close_pos is None:
+            continue
+        line_ranges.append((_line_number(text, match.start()), _line_number(text, close_pos)))
 
     item_ranges = []
     for lo, hi in line_ranges:
@@ -375,7 +492,7 @@ def file_metrics(path):
             "dcc": m.get("max_dcc"), "tool": "RCA", "clippy": 0,
         }
     t = TS_METRICS.get(path)
-    if t and path not in {"dashboard/src/server/api.ts"}:
+    if t:
         dcc = t.get("max_dcc")
         if dcc == 0 and not META[path]["status"] == "A":
             return None
