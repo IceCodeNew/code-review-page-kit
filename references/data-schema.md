@@ -23,5 +23,5 @@ FILES = {
 REVIEW = {...}  # title, heads, diff_range, hot, hot_notes, baseline, filters
 ```
 
-Keep review-specific data out of ``; the renderer is shared,
+Keep review-specific data out of this directory; the renderer is shared,
 the annotations are not.

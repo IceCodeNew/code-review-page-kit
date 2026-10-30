@@ -64,6 +64,8 @@ text below 4.5:1 contrast. Dark desktop and dark mobile are mandatory checks.
   TypeScript ESLint complexity JSON. Both may be `{}` when not measured.
 - `--workspace` is the integrated worktree: footer head and test-section mapping.
 - `--prompt` is mandatory; every page embeds the English prompt.
+- `REVIEW["validation_note"]` controls the footer claim. The generator does not
+  run linters; do not claim a tool ran unless it did.
 
 ## Design rules
 

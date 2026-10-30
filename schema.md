@@ -36,7 +36,8 @@ ANTI = {
 
 - Key is used in file/note `anti` lists.
 - Value is `(display name, why, source label)`.
-- The first row is rendered in the cover table; all rows get a filter count.
+- Every row is rendered in the cover table; the count is the number of blocks
+  tagged with that pattern (a hit count), not a filter count.
 - Use a distinct visual only for anti-pattern annotations (the renderer forces
   the violet palette and adds an `.anti-why` rationale to the note).
 
@@ -58,6 +59,7 @@ FILES = {
                 "why": "Removes the credential requirement for document readers",
                 "anti": [],
                 "span": None,     # optional: limit highlighted lines
+                # notes on fold=True files are rendered by auto-expanding the file
             },
         ],
     },
@@ -93,6 +95,7 @@ REVIEW = {
     "baseline": "Baseline: median CC 2, P95 17.",
     "conclusion": "Start with `handler`.",
     "filters": [("1", "PR 1"), ("2", "PR 2")],
+    "validation_note": "linters not run by this generator; metrics supplied",
 }
 ```
 
@@ -100,6 +103,8 @@ REVIEW = {
 - `hot` rows are looked up in `metrics.json` / `ts_metrics.json`; only names
   found there are rendered.
 - `filters` drives the topbar buttons; filter values must match the `pr` field.
+- `validation_note` is rendered verbatim in the footer. Default it to “not
+  recorded”; only claim a linter ran when the workflow actually ran it.
 
 ## Metrics JSON
 

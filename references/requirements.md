@@ -89,7 +89,7 @@ suggestions.
 ## 7. Reusable and self-documenting
 
 - Keep the reusable shell (CSS/JS, diff/annotation engine, metrics table,
-  filters, prompt, ask UI, theme) in ``.
+  filters, prompt, ask UI, theme) in this directory (`review-page-kit/`).
 - Keep review-specific data in a data module, not in the renderer.
 - Keep this skill and its references up to date so the next review starts from
   the same standard rather than re-deriving it.

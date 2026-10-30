@@ -7,10 +7,13 @@ FILES and REVIEW. The generic shell (CSS/JS/theme/wires/ask/prompt) lives in
 """
 
 import argparse
+import codecs
+import hashlib
 import html
 import importlib.util
 import json
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -65,6 +68,8 @@ BASELINE = REVIEW.get("baseline", "")
 CONCLUSION = REVIEW.get("conclusion", "")
 FILTERS = REVIEW.get("filters", [("1", "PR 1"), ("2", "PR 2")])
 REPO_NAME = REVIEW.get("repo_name", "repository")
+VALIDATION = REVIEW.get("validation_note", "未记录 linter 运行状态；仅渲染提供的指标文件")
+REVIEW_KEY = hashlib.sha1((REPO_NAME + TITLE + HEADS + DIFF_RANGE).encode("utf-8")).hexdigest()[:12]
 
 COLORS = ["#b42318", "#1d4ed8", "#0f766e", "#b45309", "#6d28d9", "#be185d"]
 HEAT = {5: "关键", 4: "重要", 3: "关注", 2: "一般", 1: "细节"}
@@ -73,6 +78,30 @@ assert set(META) == set(FILES), (set(META) - set(FILES), set(FILES) - set(META))
 
 # ---------------------------------------------------------------- diff parse
 
+def _unquote_git_path(token):
+    """Decode a path token from `diff --git`, including Git's C-style quoting."""
+    token = token.strip()
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        raw = codecs.escape_decode(token[1:-1].encode("utf-8"))[0]
+        return raw.decode("utf-8")
+    return token
+
+
+def _diff_dst_path(line):
+    """Return the destination path of a `diff --git` header, without the b/ prefix."""
+    rest = line[len("diff --git "):]
+    try:
+        parts = shlex.split(rest, posix=False)
+    except ValueError as exc:
+        raise ValueError(f"cannot parse diff header: {line!r}") from exc
+    if len(parts) != 2:
+        raise ValueError(f"cannot parse diff header: {line!r}")
+    dst = _unquote_git_path(parts[1])
+    if dst.startswith("b/"):
+        dst = dst[2:]
+    return dst
+
+
 def parse_diff(text):
     files = {}
     cur = None
@@ -80,7 +109,7 @@ def parse_diff(text):
     for line in text.splitlines():
         if line.startswith("diff --git "):
             cur = {"items": [], "hunk_count": 0}
-            files[line.split(" b/", 1)[1]] = cur
+            files[_diff_dst_path(line)] = cur
             hunk = None
         elif cur is None:
             continue
@@ -160,26 +189,88 @@ def rust_test_line(path):
     return line
 
 
-def test_start_index(path, items):
-    line = rust_test_line(path)
-    if not line:
-        return None
-    for i, item in enumerate(items):
-        ln = item.get("new") or item.get("old")
-        if ln and ln >= line:
-            return i
-    return None
+def test_item_ranges(path, items):
+    """Return item-index ranges that are Rust `#[cfg(test)] mod tests` code.
+
+    Test modules are located in the *new* source, then mapped to the diff item
+    sequence. Deleted lines before the module must not be mistaken for test
+    code, and production code after a test module is not folded.
+    """
+    source = (WS / path).read_text().splitlines() if (WS / path).exists() else []
+    line_ranges = []
+    i = 0
+    while i < len(source):
+        if source[i].strip() != "#[cfg(test)]":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(source) and not source[j].strip():
+            j += 1
+        if j >= len(source) or not source[j].strip().startswith("mod tests"):
+            i += 1
+            continue
+        depth = 0
+        started = False
+        end = j
+        for k in range(j, len(source)):
+            depth += source[k].count("{") - source[k].count("}")
+            if "{" in source[k]:
+                started = True
+            if started and depth <= 0:
+                end = k
+                break
+        line_ranges.append((i + 1, end + 1))
+        i = end + 1
+
+    item_ranges = []
+    for lo, hi in line_ranges:
+        idxs = [
+            n for n, item in enumerate(items)
+            if item.get("new") is not None and lo <= item["new"] <= hi
+        ]
+        if idxs:
+            item_ranges.append((min(idxs), max(idxs)))
+    # merge overlapping or adjacent ranges
+    merged = []
+    for lo, hi in item_ranges:
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _keep_test_range(path, items, lo, hi):
+    """Keep a test range visible when a review note anchors inside it."""
+    for note in FILES[path]["notes"]:
+        anchor = note["anchor"]
+        if any(lo <= n <= hi and anchor in items[n].get("text", "") for n in range(lo, hi + 1)):
+            return True
+    return False
 
 
 def build_blocks(path, items):
-    """Return (main_blocks, test_items_start). Each block is (start,end) item indices."""
-    tstart = test_start_index(path, items)
-    limit = tstart if tstart is not None else len(items)
+    """Return (main_blocks, folded_test_ranges).
+
+    A test range containing a review note stays visible, so the note is never
+    silently dropped by folding. Other test ranges are folded separately; code
+    after a test module remains reviewable.
+    """
+    test_ranges = test_item_ranges(path, items)
+    folded = [
+        (lo, hi) for lo, hi in test_ranges
+        if not _keep_test_range(path, items, lo, hi)
+    ]
+    excluded = {n for lo, hi in folded for n in range(lo, hi + 1)}
     rx = start_re(path)
     blocks = []
     cur = None
-    for i in range(limit):
-        item = items[i]
+    for i, item in enumerate(items):
+        if i in excluded:
+            if cur:
+                blocks.append(cur)
+                cur = None
+            continue
         if item["kind"] == "hunk":
             if cur:
                 blocks.append(cur)
@@ -195,8 +286,7 @@ def build_blocks(path, items):
             cur[1] = i
     if cur:
         blocks.append(cur)
-    # merge blocks separated only by hunk headers? keep separate
-    return blocks, tstart
+    return blocks, folded
 
 
 def new_line_at(items, idx):
@@ -211,7 +301,7 @@ def new_line_at(items, idx):
 def resolve_notes(path):
     data = FILES[path]
     items = PARSED[path]["items"]
-    blocks, tstart = build_blocks(path, items)
+    blocks, folded = build_blocks(path, items)
     notes = []
     used = set()
     for note in data["notes"]:
@@ -252,7 +342,7 @@ def resolve_notes(path):
             end = min(end, start + 70)
             n["start"], n["end"] = start, max(start, end)
     notes.sort(key=lambda n: n["start"])
-    return notes, blocks, tstart
+    return notes, blocks, folded
 
 
 RESOLVED = {}
@@ -321,8 +411,9 @@ def attr(text):
     return html.escape(text, quote=True)
 
 
-def slug(path):
-    return "f-" + re.sub(r"[^A-Za-z0-9]+", "-", path).strip("-")
+def file_id(path):
+    """Collision-free, stable id for links and DOM lookups."""
+    return "f-" + hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
 
 
 def render_line(item, note=None, first=False, last=False, color=0, badge=""):
@@ -431,7 +522,7 @@ def render_file(path, index):
     meta = META[path]
     data = FILES[path]
     items = PARSED[path]["items"]
-    notes, blocks, tstart = RESOLVED[path]
+    notes, blocks, folded = RESOLVED[path]
     status = "新增" if meta["status"] == "A" else "修改"
     status_cls = "addfile" if meta["status"] == "A" else "modfile"
     anti_file = data.get("anti", [])
@@ -442,8 +533,10 @@ def render_file(path, index):
     chips = [f'<span class="chip {status_cls}">{status}</span>']
     if pr_text:
         chips.append(f'<span class="chip pr">{pr_text}</span>')
-    if data.get("fold"):
+    if data.get("fold") and not notes:
         chips.append('<span class="chip foldc">折叠</span>')
+    elif data.get("fold") and notes:
+        chips.append('<span class="chip foldc">含批注 · 展开</span>')
     for a in all_anti:
         chips.append(f'<span class="chip anti">{esc(ANTI[a][0])}</span>')
     fm = file_metrics(path)
@@ -465,12 +558,16 @@ def render_file(path, index):
   </div>
 </header>"""
 
-    if data.get("fold"):
+    if data.get("fold") and not notes:
         summary = f'<summary><span class="fold-label">默认折叠</span>测试 / 夹具 / 说明 · {meta["add"]:,} 增 / {meta["del"]:,} 删 · {hunk_count} hunk</summary>'
-        return f"""<section class="file folded" id="{slug(path)}" data-pr="{data['pr']}" data-stars="{data['s']}" data-anti="{1 if all_anti else 0}" data-search="{esc(path + ' ' + data['one'])}">
+        return f"""<section class="file folded" id="{file_id(path)}" data-pr="{attr(data['pr'])}" data-stars="{data['s']}" data-anti="{1 if all_anti else 0}" data-search="{attr(path + ' ' + data['one'])}">
 {head}
 <details class="fold">{summary}<div class="raw-code">{render_raw(items)}</div></details>
 </section>"""
+
+    fold_open = ""
+    if data.get("fold") and notes:
+        fold_open = f'<div class="fold-open-note">该文件通常默认折叠，但包含 {len(notes)} 条块级批注；为保证批注可见，代码已展开。</div>'
 
     # line -> note mapping
     note_map = {}
@@ -483,7 +580,7 @@ def render_file(path, index):
         for i in range(n["start"], n["end"] + 1):
             old = note_map.get(i)
             note_map[i] = (id(n), color, i == n["start"], i == n["end"])
-        badges[id(n)] = f'<span class="badge c{color}" data-note="{id(n)}" style="--c:{COLORS[color]}" title="批注 {letter}">{letter}</span>'
+        badges[id(n)] = f'<button type="button" class="badge c{color}" data-note="{id(n)}" style="--c:{COLORS[color]}" title="批注 {letter}" aria-label="打开批注 {letter}">{letter}</button>'
     # compact note ids
     compact = {}
     for i, n in enumerate(notes):
@@ -518,25 +615,26 @@ def render_file(path, index):
   {f'<div class="anti-why">{anti_why}</div>' if anti_why else ''}
   <details class="ask">
     <summary>提问 / 要求 agent</summary>
-    <textarea class="ask-input" rows="3" data-key="{esc(key)}" placeholder="针对 {letter} 块提问，或写下修改要求…"></textarea>
+    <textarea class="ask-input" rows="3" data-key="{attr(key)}" placeholder="针对 {letter} 块提问，或写下修改要求…"></textarea>
     <div class="ask-actions"><button type="button" class="btn ask-copy">复制提问</button><button type="button" class="btn ask-download">下载 .md</button></div>
   </details>
 </aside>""")
 
     tests = ""
-    if tstart is not None:
-        test_items = items[tstart:]
+    for lo, hi in folded:
+        test_items = items[lo:hi + 1]
         test_lines = sum(1 for x in test_items if x["kind"] in ("add", "del", "ctx"))
-        tests = f'<details class="fold tests"><summary><span class="fold-label">默认折叠</span>测试代码 · {test_lines:,} 行</summary><div class="raw-code">{render_raw(test_items)}</div></details>'
+        tests += f'<details class="fold tests"><summary><span class="fold-label">默认折叠</span>测试代码 · {test_lines:,} 行</summary><div class="raw-code">{render_raw(test_items)}</div></details>'
 
     badge_html = ''.join(
-        f'<span class="badge c{note_color(n, i)}" data-note="{compact[id(n)]}" style="--c:{COLORS[note_color(n, i)]}" title="批注 {letters[id(n)]}">{letters[id(n)]}</span>'
+        f'<button type="button" class="badge c{note_color(n, i)}" data-note="{compact[id(n)]}" style="--c:{COLORS[note_color(n, i)]}" title="批注 {letters[id(n)]}" aria-label="打开批注 {letters[id(n)]}">{letters[id(n)]}</button>'
         for i, n in enumerate(notes)
     )
     body_cls = "file-body" if notes else "file-body no-notes"
-    return f"""<section class="file" id="{slug(path)}" data-pr="{data['pr']}" data-stars="{data['s']}" data-anti="{1 if all_anti else 0}"
- data-search="{esc(path + ' ' + data['one'] + ' ' + ' '.join(n['what'] + ' ' + n['why'] for n in notes))}">
+    return f"""<section class="file" id="{file_id(path)}" data-pr="{attr(data['pr'])}" data-stars="{data['s']}" data-anti="{1 if all_anti else 0}"
+ data-search="{attr(path + ' ' + data['one'] + ' ' + ' '.join(n['what'] + ' ' + n['why'] for n in notes))}">
 {head}
+{fold_open}
 <div class="{body_cls}">
   <div class="code-col">{code}</div>
   <div class="note-col">{''.join(notes_html)}</div>
@@ -573,7 +671,7 @@ def hot_row(path, name):
     delta = f'<span class="delta">{int(dcc):+d}</span>' if isinstance(dcc, (int, float)) and dcc else ""
     note = HOT_NOTES.get((path, name), "")
     short = path.split("/")[-1]
-    return f'<tr><td class="fn"><a href="#{slug(path)}">{esc(name)}</a></td><td class="srcfile">{esc(short)}</td><td class="cc {heat_class(cc)}">{cc}{delta}</td><td>{esc(note)}</td></tr>'
+    return f'<tr><td class="fn"><a href="#{file_id(path)}">{esc(name)}</a></td><td class="srcfile">{esc(short)}</td><td class="cc {heat_class(cc)}">{cc}{delta}</td><td>{esc(note)}</td></tr>'
 
 
 hot_rows = "".join(hot_row(p, n) for p, n in HOT)
@@ -597,7 +695,7 @@ for gid, title, _ in GROUPS:
     for path, d in FILES.items():
         if d["g"] != gid:
             continue
-        nav.append(f'<a class="nav-file" href="#{slug(path)}" data-pr="{d["pr"]}" data-stars="{d["s"]}" data-anti="{1 if (d.get("anti") or any(n.get("anti") for n in d.get("notes", []))) else 0}"><span class="dot s{d["s"]}"></span>{esc(Path(path).name)}</a>')
+        nav.append(f'<a class="nav-file" href="#{file_id(path)}" data-pr="{attr(d["pr"])}" data-stars="{d["s"]}" data-anti="{1 if (d.get("anti") or any(n.get("anti") for n in d.get("notes", []))) else 0}"><span class="dot s{d["s"]}"></span>{esc(Path(path).name)}</a>')
     nav.append("</div>")
 
 sections = []
@@ -660,7 +758,7 @@ page = f"""<!doctype html>
 <style>{CSS}</style>
 <script>{THEME_INIT}</script>
 </head>
-<body data-heads="{attr(HEADS)}" data-title="{attr(DOC_TITLE)}">
+<body data-heads="{attr(HEADS)}" data-title="{attr(DOC_TITLE)}" data-review-key="{REVIEW_KEY}">
 <div class="topbar">
   <span class="doc">{esc(DOC_TITLE)}</span>
   <span class="meta">{esc(REPO_NAME)} · {len(FILES)} 文件 · 本地集成</span>
@@ -679,7 +777,7 @@ page = f"""<!doctype html>
 
 <div class="layout">
   <nav class="nav" aria-label="文件目录">
-    <div class="nav-head">文件 · 94</div>
+    <div class="nav-head">文件 · {len(FILES)}</div>
     <a class="nav-file nav-prompt" href="#prompt"><span class="dot s5"></span>Review prompt (EN)</a>
     {''.join(nav)}
   </nav>
@@ -689,7 +787,7 @@ page = f"""<!doctype html>
       <h1>{esc(TITLE)}</h1>
       <p class="sub">{SUBTITLE}</p>
       <div class="stats">
-        <span class="stat-chip"><b>94</b> 文件</span>
+        <span class="stat-chip"><b>{len(FILES)}</b> 文件</span>
         <span class="stat-chip"><b>+{total_add:,}</b> / <b>−{total_del:,}</b></span>
         <span class="stat-chip"><b>{new_files}</b> 个新增</span>
         <span class="stat-chip"><b>{notes_total}</b> 条块级批注</span>
@@ -755,7 +853,7 @@ page = f"""<!doctype html>
 
     {''.join(out_sections)}
 
-    <div class="footer">本地集成：<code>{esc(str(WS))}</code> @ <code>{HEAD}</code> · 差异 {esc(DIFF_RANGE)} · clippy / RCA / Radon / ESLint 均为本地运行</div>
+    <div class="footer">本地集成：<code>{esc(str(WS))}</code> @ <code>{HEAD}</code> · 差异 {esc(DIFF_RANGE)} · {esc(VALIDATION)}</div>
   </main>
 </div>
 

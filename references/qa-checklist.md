@@ -46,10 +46,12 @@ mobile, light mobile**:
 
 - [ ] no `pageerror` / console error;
 - [ ] no horizontal overflow (`scrollWidth <= clientWidth + 1`);
+- [ ] wires: desktop `wires == notes`; at ≤1240px `wires == 0`;
 - [ ] `notes == wires == badges == asks`;
 - [ ] theme matches `prefers-color-scheme` on load;
 - [ ] theme toggle changes preference and survives reload;
-- [ ] anti filter shows only notes with an anti chip (and at least one);
+- [ ] anti filter shows exactly the anti-tagged notes (zero is valid when the
+      page has no anti notes);
 - [ ] every visible text node meets 4.5:1 contrast (decorative line numbers,
       diff markers, dim stars and `\ No newline` are excluded);
 - [ ] screenshots produced for light, dark, anti and the mobile modal;
@@ -71,7 +73,8 @@ Look at the screenshots, not only the computed values:
 
 ## Anti-filter pass
 
-- [ ] Click “反模式”. Only files with block-level anti notes remain.
+- [ ] Click “反模式”. Only files with block-level anti notes remain; the
+      visible count equals the page’s total anti-note count (including zero).
 - [ ] Every visible note has a violet chip and an anti rationale; notes unrelated
       to the anti-pattern are hidden.
 - [ ] Non-anti annotated lines lose their tint/outline; code context is not

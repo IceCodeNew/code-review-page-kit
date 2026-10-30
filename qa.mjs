@@ -32,11 +32,17 @@ fs.mkdirSync(shotDir, { recursive: true })
 function contrastProbe() {
   function rgb(value) {
     if (value.startsWith('color(srgb')) {
-      const nums = value.match(/[\d.]+/g).slice(1, 4).map(Number)
-      return nums.map((n) => n * 255)
+      const nums = value.match(/[\d.]+/g)
+      if (!nums || nums.length < 3) throw new Error('bad color: ' + value)
+      const rgb = nums.slice(0, 3).map(Number)
+      if (!rgb.every(Number.isFinite)) throw new Error('bad color: ' + value)
+      return rgb.map((n) => n * 255)
     }
     const nums = value.match(/\d+(\.\d+)?/g)
-    return nums ? nums.slice(0, 3).map(Number) : [0, 0, 0]
+    if (!nums || nums.length < 3) throw new Error('bad color: ' + value)
+    const rgb = nums.slice(0, 3).map(Number)
+    if (!rgb.every(Number.isFinite)) throw new Error('bad color: ' + value)
+    return rgb
   }
   function luminance(color) {
     const channel = color.map((v) => {
@@ -65,11 +71,17 @@ function contrastProbe() {
     // Decorative hints: line numbers, diff markers, dim stars, folded labels.
     if (el.classList.contains('ln') || el.classList.contains('mark') || el.classList.contains('dim')) continue
     if (el.closest('.stars') || el.closest('.dl.meta')) continue
-    const fg = rgb(getComputedStyle(el).color)
-    const bg = background(el)
-    const l1 = luminance(fg)
-    const l2 = luminance(bg)
-    const ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
+    let ratio
+    try {
+      const fg = rgb(getComputedStyle(el).color)
+      const bg = background(el)
+      const l1 = luminance(fg)
+      const l2 = luminance(bg)
+      ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
+    } catch (err) {
+      failures.push({ text: text.slice(0, 40), selector: 'color-parse', ratio: null, error: String(err) })
+      continue
+    }
     if (ratio < 4.5) {
       failures.push({
         text: text.slice(0, 40),
@@ -118,7 +130,8 @@ async function check(browser, mode, viewport, label) {
   if (state.theme !== expected) failures.push(`${label}: theme ${state.theme}, expected ${expected}`)
   if (errors.length) failures.push(`${label}: console/page errors: ${errors.slice(0, 3).join(' | ')}`)
   if (state.scrollWidth > state.clientWidth + 1) failures.push(`${label}: horizontal overflow ${state.scrollWidth} > ${state.clientWidth}`)
-  if (state.notes !== state.wires) failures.push(`${label}: ${state.notes} notes but ${state.wires} wires`)
+  const expectedWires = state.clientWidth > 1240 ? state.notes : 0
+  if (state.wires !== expectedWires) failures.push(`${label}: ${state.notes} notes but ${state.wires} wires (expected ${expectedWires})`)
   if (state.notes !== state.badges) failures.push(`${label}: ${state.notes} notes but ${state.badges} badges`)
   if (state.asks !== state.notes) failures.push(`${label}: ${state.asks} ask inputs but ${state.notes} notes`)
   if (state.contrast.length) failures.push(`${label}: ${state.contrast.length} low-contrast text nodes (${state.contrast.map((c) => c.selector + ':' + c.ratio).join(', ')})`)
@@ -128,12 +141,13 @@ async function check(browser, mode, viewport, label) {
   await page.evaluate(() => document.querySelector('button.flt[data-f="anti"]').click())
   await page.waitForTimeout(250)
   const anti = await page.evaluate(() => ({
+    total: document.querySelectorAll('.note[data-anti="1"]').length,
     visible: document.querySelectorAll('.note:not(.filtered-out)').length,
     unrelated: [...document.querySelectorAll('.note:not(.filtered-out)')].filter((n) => !n.querySelector('.chip.anti')).length,
     files: document.querySelectorAll('section.file:not(.hidden)').length,
   }))
   if (anti.unrelated) failures.push(`${label}: anti filter shows ${anti.unrelated} unrelated notes`)
-  if (anti.visible === 0) failures.push(`${label}: anti filter shows no notes`)
+  if (anti.total !== anti.visible) failures.push(`${label}: anti filter shows ${anti.visible}/${anti.total} anti notes`)
   await page.screenshot({ path: path.join(shotDir, `${label}-anti.png`), fullPage: false })
 
   await page.evaluate(() => { const all = document.querySelector('button.flt[data-f="all"]'); if (all) all.click() })
@@ -164,9 +178,16 @@ const mobile = await browser.newContext({ viewport: { width: 390, height: 844 },
 const page = await mobile.newPage()
 await page.goto(url, { waitUntil: 'load', timeout: 120000 })
 await page.waitForTimeout(500)
-await page.locator('.badge').first().click()
+const firstBadge = page.locator('.badge').first()
+if ((await firstBadge.evaluate((el) => el.tagName)) !== 'BUTTON') failures.push('dark-mobile: badge is not a button')
+await firstBadge.focus()
+await firstBadge.press('Enter')
 if (!(await page.locator('#modal').evaluate((el) => el.classList.contains('open')))) {
   failures.push('dark-mobile: badge did not open the note dialog')
+}
+await page.keyboard.press('Escape')
+if (await page.locator('#modal').evaluate((el) => el.classList.contains('open'))) {
+  failures.push('dark-mobile: Escape did not close the note dialog')
 }
 await page.screenshot({ path: path.join(shotDir, 'dark-mobile-modal.png') })
 await mobile.close()

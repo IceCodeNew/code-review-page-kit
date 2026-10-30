@@ -11,13 +11,24 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch {} },
   };
 
+  function askKey(el) {
+    const review = document.body.dataset.reviewKey || 'default';
+    return ASK + review + ':' + (el.id === 'global-ask' ? 'global' : el.dataset.key);
+  }
+
   function hydrateAsk(root) {
     (root || document).querySelectorAll('.ask-input, #global-ask').forEach((el) => {
-      const key = ASK + (el.id === 'global-ask' ? 'global' : el.dataset.key);
+      const key = askKey(el);
       const saved = store.get(key);
-      if (saved !== null && el.value === '') el.value = saved;
+      // localStorage is authoritative: a modal clone must not inherit a stale
+      // nonempty value from the hidden original.
+      if (saved !== null) el.value = saved;
       el.addEventListener('input', () => {
         store.set(key, el.value);
+        // Keep the desktop original and the mobile clone in sync.
+        document.querySelectorAll('.ask-input').forEach((other) => {
+          if (other !== el && askKey(other) === key) other.value = el.value;
+        });
         const file = el.closest('.file');
         if (file) setTimeout(() => layout(file), 100);
       });
@@ -106,6 +117,8 @@
     if (!notes.length) return;
     const code = body.querySelector('.code-col');
     if (!code.offsetWidth) return;
+    const noteCol = body.querySelector('.note-col');
+    const showWires = !!noteCol && noteCol.offsetParent !== null && noteCol.offsetWidth > 0;
     const bodyRect = body.getBoundingClientRect();
     let bottom = 0;
     const wires = [];
@@ -138,7 +151,7 @@
         badge.style.left = badgeX + 'px';
         badge.style.display = '';
       }
-      wires.push({
+      if (showWires) wires.push({
         x1: badgeX + 9,
         y1: first.top - bodyRect.top + 10,
         x2: nr.left - bodyRect.left - 2,
@@ -230,12 +243,21 @@
 
   const modal = document.getElementById('modal');
   const modalBody = document.getElementById('modal-body');
-  modal.querySelector('.close').addEventListener('click', () => modal.classList.remove('open'));
-  modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.remove('open'); });
+  let lastBadge = null;
+  function closeModal() {
+    modal.classList.remove('open');
+    if (lastBadge) { lastBadge.focus(); lastBadge = null; }
+  }
+  modal.querySelector('.close').addEventListener('click', closeModal);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('open')) closeModal();
+  });
 
   document.addEventListener('click', (e) => {
     const b = e.target.closest('.badge');
     if (!b) return;
+    lastBadge = b;
     const file = b.closest('.file');
     const note = file.querySelector('.note[data-note="' + b.dataset.note + '"]');
     if (!note) return;
@@ -256,6 +278,7 @@
       modalBody.replaceChildren(clone);
       hydrateAsk(clone);
       modal.classList.add('open');
+      modal.querySelector('.close').focus();
     }
   });
 
