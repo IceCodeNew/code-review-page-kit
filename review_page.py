@@ -3,7 +3,7 @@
 
 The review content lives in a Python data module (`--data`) with GROUPS, ANTI,
 FILES and REVIEW. The generic shell (CSS/JS/theme/wires/ask/prompt) lives in
-`assets/`. See README.md and ../../SKILL.md.
+`assets/`. See README.md and SKILL.md.
 """
 
 import argparse
