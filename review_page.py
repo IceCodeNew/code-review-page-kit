@@ -69,7 +69,7 @@ CONCLUSION = REVIEW.get("conclusion", "")
 FILTERS = REVIEW.get("filters", [("1", "PR 1"), ("2", "PR 2")])
 REPO_NAME = REVIEW.get("repo_name", "repository")
 VALIDATION = REVIEW.get("validation_note", "未记录 linter 运行状态；仅渲染提供的指标文件")
-REVIEW_KEY = hashlib.sha1((REPO_NAME + TITLE + HEADS + DIFF_RANGE).encode("utf-8")).hexdigest()[:12]
+REVIEW_KEY = hashlib.sha1((REPO_NAME + TITLE + HEADS + DIFF_RANGE + DIFF).encode("utf-8")).hexdigest()[:12]
 
 COLORS = ["#b42318", "#1d4ed8", "#0f766e", "#b45309", "#6d28d9", "#be185d"]
 HEAT = {5: "关键", 4: "重要", 3: "关注", 2: "一般", 1: "细节"}
@@ -90,6 +90,16 @@ def _unquote_git_path(token):
 def _diff_dst_path(line):
     """Return the destination path of a `diff --git` header, without the b/ prefix."""
     rest = line[len("diff --git "):]
+    if not rest.startswith('"'):
+        # --no-renames: header is "a/<path> b/<path>", and a path with spaces
+        # is not quoted. Recover it from the known identical left/right halves.
+        if rest.startswith("a/") and len(rest) >= 5:
+            n = (len(rest) - 5) // 2
+            if n > 0 and rest[2 + n:2 + n + 3] == " b/" and rest[2 + n + 3:] == rest[2:2 + n]:
+                return rest[2 + n + 3:]
+        path = rest.rsplit(" b/", 1)[-1]
+        if path != rest:
+            return path
     try:
         parts = shlex.split(rest, posix=False)
     except ValueError as exc:
@@ -196,7 +206,10 @@ def test_item_ranges(path, items):
     sequence. Deleted lines before the module must not be mistaken for test
     code, and production code after a test module is not folded.
     """
-    source = (WS / path).read_text().splitlines() if (WS / path).exists() else []
+    if not path.endswith(".rs"):
+        return []
+    src = WS / path
+    source = src.read_text(errors="replace").splitlines() if src.exists() else []
     line_ranges = []
     i = 0
     while i < len(source):

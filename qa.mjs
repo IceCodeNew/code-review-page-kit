@@ -71,10 +71,10 @@ function contrastProbe() {
     // Decorative hints: line numbers, diff markers, dim stars, folded labels.
     if (el.classList.contains('ln') || el.classList.contains('mark') || el.classList.contains('dim')) continue
     if (el.closest('.stars') || el.closest('.dl.meta')) continue
-    let ratio
+    let ratio, bg
     try {
       const fg = rgb(getComputedStyle(el).color)
-      const bg = background(el)
+      bg = background(el)
       const l1 = luminance(fg)
       const l2 = luminance(bg)
       ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
